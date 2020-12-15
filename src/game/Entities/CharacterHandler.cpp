@@ -142,7 +142,7 @@ class CharacterHandler
 
             // The bot's WorldSession is owned by the bot's Player object
             // The bot's WorldSession is deleted by PlayerbotMgr::LogoutPlayerBot
-            WorldSession* botSession = new WorldSession(lqh->GetAccountId(), nullptr, SEC_PLAYER, 0, LOCALE_enUS);
+            WorldSession* botSession = new WorldSession(lqh->GetAccountId(), nullptr, SEC_PLAYER, 0, DEFAULT_LOCALE);
             botSession->HandlePlayerLogin(lqh); // will delete lqh
             masterSession->GetPlayer()->GetPlayerbotMgr()->OnBotLogin(botSession->GetPlayer());
         }
@@ -552,16 +552,29 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder* holder)
         return;
     }
 
+    m_currentPlayerLevel = pCurrChar->getLevel();
+
     pCurrChar->GetMotionMaster()->Initialize();
 
     Group* group = pCurrChar->GetGroup();
 
     WorldPacket data(SMSG_LOGIN_VERIFY_WORLD, 20);
     data << pCurrChar->GetMapId();
-    data << pCurrChar->GetPositionX();
-    data << pCurrChar->GetPositionY();
-    data << pCurrChar->GetPositionZ();
-    data << pCurrChar->GetOrientation();
+    if (pCurrChar->GetTransport())
+    {
+        Position const& transportPosition = pCurrChar->m_movementInfo.GetTransportPos();
+        data << transportPosition.x;
+        data << transportPosition.y;
+        data << transportPosition.z;
+        data << transportPosition.o;
+    }
+    else
+    {
+        data << pCurrChar->GetPositionX();
+        data << pCurrChar->GetPositionY();
+        data << pCurrChar->GetPositionZ();
+        data << pCurrChar->GetOrientation();
+    }
     SendPacket(data);
 
     data.Initialize(SMSG_ACCOUNT_DATA_TIMES, 128);
@@ -630,7 +643,7 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder* holder)
     uint32 miscRequirement = 0;
     AreaLockStatus lockStatus = AREA_LOCKSTATUS_OK;
     if (AreaTrigger const* at = sObjectMgr.GetMapEntranceTrigger(pCurrChar->GetMapId()))
-        lockStatus = pCurrChar->GetAreaTriggerLockStatus(at, miscRequirement);
+        lockStatus = pCurrChar->GetAreaTriggerLockStatus(at, miscRequirement, true);
     else
     {
         // Some basic checks in case of a map without areatrigger

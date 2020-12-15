@@ -49,6 +49,7 @@
 #include "Entities/CreatureLinkingMgr.h"
 #include "Tools/Formulas.h"
 #include "Metric/Metric.h"
+#include "Entities/Transports.h"
 
 #include <math.h>
 #include <limits>
@@ -213,8 +214,9 @@ static const SpellPartialResistDistribution SPELL_PARTIAL_RESIST_DISTRIBUTION = 
 
 void MovementInfo::Read(ByteBuffer& data)
 {
+    stime = sWorld.GetCurrentMSTime();
     data >> moveFlags;
-    data >> time;
+    data >> ctime;
     data >> pos.x;
     data >> pos.y;
     data >> pos.z;
@@ -241,7 +243,14 @@ void MovementInfo::Read(ByteBuffer& data)
         data >> jump.cosAngle;
         data >> jump.sinAngle;
         data >> jump.xyspeed;
+        if (!jump.startClientTime)
+        {
+            jump.startClientTime = ctime;
+            jump.start = pos;
+        }
     }
+    else
+        jump.startClientTime = 0;
 
     if (HasMovementFlag(MOVEFLAG_SPLINE_ELEVATION))
     {
@@ -252,7 +261,7 @@ void MovementInfo::Read(ByteBuffer& data)
 void MovementInfo::Write(ByteBuffer& data) const
 {
     data << moveFlags;
-    data << time;
+    data << stime;
     data << pos.x;
     data << pos.y;
     data << pos.z;
@@ -285,6 +294,19 @@ void MovementInfo::Write(ByteBuffer& data) const
     {
         data << u_unk1;                                     // unknown
     }
+}
+
+float MovementInfo::GetOrientationInMotion(MovementFlags flags, float orientation)
+{
+    float mod = ((flags & MOVEFLAG_BACKWARD) ? M_PI_F : 0);
+
+    if (flags & (MOVEFLAG_STRAFE_LEFT | MOVEFLAG_STRAFE_RIGHT))
+    {
+        float flip = (M_PI_F * ((flags & MOVEFLAG_STRAFE_LEFT) ? 0.5f : -0.5f));
+        flip = ((flags & MOVEFLAG_BACKWARD) ? -flip : flip);
+        mod += (flip * ((flags & (MOVEFLAG_FORWARD | MOVEFLAG_BACKWARD)) ? 0.5f : 1));
+    }
+    return MapManager::NormalizeOrientation(orientation + mod);
 }
 
 ////////////////////////////////////////////////////////////
@@ -392,6 +414,7 @@ Unit::Unit() :
 
     m_noThreat = false;
     m_extraAttacksExecuting = false;
+    m_debuggingMovement = false;
 
     m_baseSpeedWalk = 1.f;
     m_baseSpeedRun = 1.f;
@@ -550,7 +573,7 @@ bool Unit::UpdateMeleeAttackingState()
     if (!victim || IsNonMeleeSpellCasted(false))
         return false;
 
-    if (GetTypeId() != TYPEID_PLAYER && (!static_cast<Creature*>(this)->CanInitiateAttack() || !victim->isInAccessablePlaceFor(static_cast<Creature*>(this))))
+    if (GetTypeId() != TYPEID_PLAYER && (!static_cast<Creature*>(this)->CanInitiateAttack()))
         return false;
 
     if (!isAttackReady(BASE_ATTACK) && !(isAttackReady(OFF_ATTACK) && hasOffhandWeaponForAttack()))
@@ -622,7 +645,6 @@ bool Unit::UpdateMeleeAttackingState()
 
 void Unit::SendHeartBeat()
 {
-    m_movementInfo.UpdateTime(GetMap()->GetCurrentMSTime());
     WorldPacket data(MSG_MOVE_HEARTBEAT, 31);
     data << GetPackGUID();
     data << m_movementInfo;
@@ -716,7 +738,7 @@ void Unit::RemoveSpellsCausingAura(AuraType auraType, SpellAuraHolder* except, b
 {
     for (AuraList::const_iterator iter = m_modAuras[auraType].begin(); iter != m_modAuras[auraType].end();)
     {
-        if ((*iter)->GetHolder() == except || (onlyNegative && (*iter)->GetHolder()->IsPositive()))
+        if ((*iter)->GetHolder() == except || (onlyNegative && ((*iter)->GetHolder()->IsPositive() || (*iter)->GetHolder()->GetSpellProto()->HasAttribute(SPELL_ATTR_AURA_IS_DEBUFF))))
         {
             ++iter;
             continue;
@@ -3796,8 +3818,18 @@ void Unit::_UpdateAutoRepeatSpell()
     // apply delay
     if (m_AutoRepeatFirstCast)
     {
-        RemoveSpellCooldown(*m_currentSpells[CURRENT_AUTOREPEAT_SPELL]->m_spellInfo, false);
-        AddCooldown(*m_currentSpells[CURRENT_AUTOREPEAT_SPELL]->m_spellInfo, nullptr, false, 500);
+        TimePoint expirationTime;
+        bool isPermanent;
+        if (GetExpireTime(*m_currentSpells[CURRENT_AUTOREPEAT_SPELL]->m_spellInfo, expirationTime, isPermanent))
+        {
+            if (GetMap()->GetCurrentClockTime() + std::chrono::milliseconds(500) > expirationTime)
+            {
+                RemoveSpellCooldown(*m_currentSpells[CURRENT_AUTOREPEAT_SPELL]->m_spellInfo, false);
+                AddCooldown(*m_currentSpells[CURRENT_AUTOREPEAT_SPELL]->m_spellInfo, nullptr, false, 500);
+            }
+        }
+        else
+            AddCooldown(*m_currentSpells[CURRENT_AUTOREPEAT_SPELL]->m_spellInfo, nullptr, false, 500);
         m_AutoRepeatFirstCast = false;
         return;
     }
@@ -4043,6 +4075,9 @@ void Unit::SetInFront(Unit const* target)
 void Unit::SetFacingTo(float ori)
 {
     Movement::MoveSplineInit init(*this);
+    // supplied orientation is global space but we need local orientation
+    if (GenericTransport* transport = GetTransport())
+        transport->CalculatePassengerOrientation(ori);
     init.SetFacing(ori);
     init.Launch();
 }
@@ -4308,7 +4343,7 @@ bool Unit::AddSpellAuraHolder(SpellAuraHolder* holder)
             else
             {
                 //any stackable case with amount should mod existing stack amount
-                if (aurSpellInfo->StackAmount && aurSpellInfo->rangeIndex != SPELL_RANGE_IDX_SELF_ONLY && !aurSpellInfo->HasAttribute(SPELL_ATTR_EX3_STACK_FOR_DIFF_CASTERS))
+                if (aurSpellInfo->StackAmount && !IsChanneledSpell(aurSpellInfo) && !aurSpellInfo->HasAttribute(SPELL_ATTR_EX3_STACK_FOR_DIFF_CASTERS))
                 {
                     foundHolder->ModStackAmount(holder->GetStackAmount(), holder->GetCaster());
                     return false;
@@ -5791,7 +5826,7 @@ bool Unit::Attack(Unit* victim, bool meleeAttack)
     return true;
 }
 
-bool Unit::AttackStop(bool targetSwitch /*= false*/, bool includingCast /*= false*/, bool includingCombo /*= false*/)
+bool Unit::AttackStop(bool targetSwitch /*= false*/, bool includingCast /*= false*/, bool includingCombo /*= false*/, bool clientInitiated /*= false*/)
 {
     if (includingCombo)
         ClearComboPoints();
@@ -5804,6 +5839,8 @@ bool Unit::AttackStop(bool targetSwitch /*= false*/, bool includingCast /*= fals
     if (targetSwitch && GetTypeId() != TYPEID_PLAYER)
         SetTargetGuid(ObjectGuid());
 
+    if (!clientInitiated && IsPlayer())
+        ((Player*)this)->SendAttackSwingCancelAttack();     // melee and ranged forced attack cancel
     MeleeAttackStop(m_attacking);
 
     if (m_attacking)
@@ -5817,10 +5854,8 @@ bool Unit::AttackStop(bool targetSwitch /*= false*/, bool includingCast /*= fals
 
 void Unit::CombatStop(bool includingCast, bool includingCombo)
 {
-    if (GetTypeId() == TYPEID_PLAYER)
-        ((Player*)this)->SendAttackSwingCancelAttack();     // melee and ranged forced attack cancel
-
     AttackStop(true, includingCast, includingCombo);
+
     RemoveAllAttackers();
     DeleteThreatList();
 
@@ -5880,12 +5915,6 @@ void Unit::RemoveAllAttackers()
     {
         AttackerSet::iterator iter = m_attackers.begin();
         (*iter)->AttackStop();
-
-        if (m_attacking)
-        {
-            sLog.outError("WORLD: Unit has an attacker that isn't attacking it!");
-            m_attackers.erase(iter);
-        }
     }
 }
 
@@ -7644,11 +7673,7 @@ bool Unit::IsVisibleForOrDetect(Unit const* u, WorldObject const* viewPoint, boo
 
     // player visible for other player if not logout and at same transport
     // including case when player is out of world
-    bool at_same_transport =
-        GetTypeId() == TYPEID_PLAYER &&  u->GetTypeId() == TYPEID_PLAYER &&
-        !((Player*)this)->GetSession()->PlayerLogout() && !((Player*)u)->GetSession()->PlayerLogout() &&
-        !((Player*)this)->GetSession()->PlayerLoading() && !((Player*)u)->GetSession()->PlayerLoading() &&
-        ((Player*)this)->GetTransport() && ((Player*)this)->GetTransport() == ((Player*)u)->GetTransport();
+    bool at_same_transport = GetTransport() == u->GetTransport();
 
     // not in world
     if (!at_same_transport && (!IsInWorld() || !u->IsInWorld()))
@@ -8182,7 +8207,7 @@ bool Unit::SelectHostileTarget()
             if (target != this)
                 SetInFront(target);
 
-        return !(AI()->GetCombatScriptStatus() && getThreatManager().isThreatListEmpty());
+        return !((AI()->GetCombatScriptStatus() || IsStunned()) && getThreatManager().isThreatListEmpty());
     }
 
     Unit* target = nullptr;
@@ -8318,7 +8343,7 @@ void Unit::ApplyDiminishingToDuration(DiminishingGroup group, int32& duration, U
 
     float mod = 1.0f;
 
-    const bool pvp = (GetTypeId() == TYPEID_PLAYER && caster->GetTypeId() == TYPEID_PLAYER);
+    const bool pvp = (HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED) && caster->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED));
 
     // Some diminishings applies to mobs too (for example, Stun)
     if ((GetDiminishingReturnsGroupType(group) == DRTYPE_PLAYER && pvp) || GetDiminishingReturnsGroupType(group) == DRTYPE_ALL)
@@ -8401,9 +8426,6 @@ bool Unit::IsOfflineTarget(Unit* victim) const
         return true;
 
     if (!CanAttack(victim))
-        return true;
-
-    if (!victim->isInAccessablePlaceFor(this))
         return true;
 
     return false;
@@ -8857,6 +8879,12 @@ void Unit::RemoveFromWorld()
         RemoveAllGameObjects();
         RemoveAllDynObjects();
         GetViewPoint().Event_RemovedFromWorld();
+
+        if (!IsPlayer())
+            if (GenericTransport* transport = GetTransport())
+                transport->RemovePassenger(this);
+
+        m_FollowingRefManager.clearReferences();
     }
 
     Object::RemoveFromWorld();
@@ -9204,6 +9232,8 @@ void CharmInfo::SetStayPosition()
     if (!m_unit->movespline->Finalized())
     {
         Movement::Location loc = m_unit->movespline->ComputePosition();
+        if (GenericTransport* transport = m_unit->GetTransport())
+            transport->CalculatePassengerPosition(loc.x, loc.y, loc.z, &loc.orientation);
         m_stayPosX = loc.x;
         m_stayPosY = loc.y;
         m_stayPosZ = loc.z;
@@ -9315,21 +9345,27 @@ void Unit::InterruptMoving(bool forceSendStop /*=false*/)
 
     if (!movespline->Finalized())
     {
-        Movement::Location loc = movespline->ComputePosition();
+        Movement::Location computedLoc = movespline->ComputePosition();
+        Position pos(computedLoc.x, computedLoc.y, computedLoc.z, computedLoc.orientation);
+        if (GenericTransport* transport = GetTransport())
+        {
+            m_movementInfo.UpdateTransportData(pos);
+            transport->CalculatePassengerPosition(pos.x, pos.y, pos.z, &pos.o);
+        }
 
         if (movespline->isFacing() && movespline->isFacingTarget())
         {
             if (Unit const* target = ObjectAccessor::GetUnit(*this, ObjectGuid(movespline->GetFacing().target)))
-                loc.orientation = GetAngle(target);
+                pos.o = GetAngle(target);
             else
             {
-                float angle = atan2((loc.y - GetPositionY()), (loc.x - GetPositionX()));
-                loc.orientation = (angle >= 0 ? angle : ((2 * M_PI_F) + angle));
+                float angle = atan2((pos.y - GetPositionY()), (pos.x - GetPositionX()));
+                pos.o = (angle >= 0 ? angle : ((2 * M_PI_F) + angle));
             }
         }
 
         movespline->_Interrupt();
-        Relocate(loc.x, loc.y, loc.z, loc.orientation);
+        Relocate(pos.x, pos.y, pos.z, pos.o);
         isMoving = true;
     }
 
@@ -9514,25 +9550,18 @@ void Unit::SetFeignDeath(bool apply, ObjectGuid casterGuid /*= ObjectGuid()*/, u
                 if (instance && sWorld.getConfig(CONFIG_BOOL_INSTANCE_STRICT_COMBAT_LOCKDOWN) && instance->IsEncounterInProgress())
                 {
                     // This rule was introduced in 2.3.0+: do not clear combat state if zone is in combat lockdown by encounter
-                    if (GetTypeId() == TYPEID_PLAYER)
-                        static_cast<Player*>(this)->SendAttackSwingCancelAttack();
                     AttackStop(true, false, true);
                     getHostileRefManager().addThreatPercent(-100);
                     getHostileRefManager().updateOnlineOfflineState(false);
                 }
                 else
-                {
                     CombatStop();
-                }
             }
             else
             {
                 // Unsuccessful FD: do not set UNIT_STAT_FEIGN_DEATH, send resist message and stop attack (+clear target for player-controlled npcs)
                 if (GetTypeId() == TYPEID_PLAYER)
-                {
                     static_cast<Player*>(this)->SendFeignDeathResisted();
-                    static_cast<Player*>(this)->SendAttackSwingCancelAttack();
-                }
                 AttackStop(true, false, true);
             }
         }
@@ -10158,10 +10187,6 @@ void Unit::StopAttackFaction(uint32 faction_id)
             AttackStop();
             if (IsNonMeleeSpellCasted(false))
                 InterruptNonMeleeSpells(false);
-
-            // melee and ranged forced attack cancel
-            if (GetTypeId() == TYPEID_PLAYER)
-                ((Player*)this)->SendAttackSwingCancelAttack();
         }
     }
 
@@ -10337,24 +10362,59 @@ void Unit::UpdateSplineMovement(uint32 t_diff)
     if (m_movesplineTimer.Passed() || arrived)
     {
         m_movesplineTimer.Reset(POSITION_UPDATE_DELAY);
-        Movement::Location loc = movespline->ComputePosition();
+        Movement::Location computedLoc = movespline->ComputePosition();
+        Position pos(computedLoc.x, computedLoc.y, computedLoc.z, computedLoc.orientation);
+        if (GenericTransport* transport = GetTransport())
+        {
+            m_movementInfo.UpdateTransportData(pos);
+            transport->CalculatePassengerPosition(pos.x, pos.y, pos.z, &pos.o);
+        }
 
         if (movespline->isFacing() && movespline->isFacingTarget())
         {
             if (Unit const* target = ObjectAccessor::GetUnit(*this, ObjectGuid(movespline->GetFacing().target)))
-                loc.orientation = GetAngle(target);
+                pos.o = GetAngle(target);
             else
             {
-                float angle = atan2((loc.y - GetPositionY()), (loc.x - GetPositionX()));
-                loc.orientation = (angle >= 0 ? angle : ((2 * M_PI_F) + angle));
+                float angle = atan2((pos.y - GetPositionY()), (pos.x - GetPositionX()));
+                pos.o = (angle >= 0 ? angle : ((2 * M_PI_F) + angle));
             }
         }
 
         if (GetTypeId() == TYPEID_PLAYER)
-            ((Player*)this)->SetPosition(loc.x, loc.y, loc.z, loc.orientation);
+            ((Player*)this)->SetPosition(pos.x, pos.y, pos.z, pos.o);
         else
-            GetMap()->CreatureRelocation((Creature*)this, loc.x, loc.y, loc.z, loc.orientation);
+            GetMap()->CreatureRelocation((Creature*)this, pos.x, pos.y, pos.z, pos.o);
     }
+}
+
+void Unit::UpdateSplinePosition()
+{
+    Movement::Location computedLoc = movespline->ComputePosition();
+    Position pos(computedLoc.x, computedLoc.y, computedLoc.z, computedLoc.orientation);
+    if (GenericTransport* transport = GetTransport())
+    {
+        m_movementInfo.UpdateTransportData(pos);
+        transport->CalculatePassengerPosition(pos.x, pos.y, pos.z, &pos.o);
+    }
+    if (GenericTransport* transport = GetTransport())
+        transport->CalculatePassengerPosition(pos.x, pos.y, pos.z, &pos.o);
+
+    if (movespline->isFacing() && movespline->isFacingTarget())
+    {
+        if (Unit const* target = ObjectAccessor::GetUnit(*this, ObjectGuid(movespline->GetFacing().target)))
+            pos.o = GetAngle(target);
+        else
+        {
+            float angle = atan2((pos.y - GetPositionY()), (pos.x - GetPositionX()));
+            pos.o = (angle >= 0 ? angle : ((2 * M_PI_F) + angle));
+        }
+    }
+
+    if (IsPlayer())
+        static_cast<Player*>(this)->SetPosition(pos.x, pos.y, pos.z, pos.o);
+    else
+        GetMap()->CreatureRelocation((Creature*)this, pos.x, pos.y, pos.z, pos.o);
 }
 
 void Unit::DisableSpline()
@@ -10417,7 +10477,6 @@ Unit* Unit::TakePossessOf(SpellEntry const* spellEntry, uint32 effIdx, float x, 
     possessed->addUnitState(UNIT_STAT_POSSESSED);                       // also set internal unit state flag
     possessed->SelectLevel(getLevel());                                 // set level to same level than summoner TODO:: not sure its always the case...
     possessed->SetLinkedToOwnerAura(TEMPSPAWN_LINKED_AURA_OWNER_CHECK | TEMPSPAWN_LINKED_AURA_REMOVE_OWNER); // set what to do if linked aura is removed or the creature is dead.
-    possessed->SetWalk(IsWalking(), true);                              // sync the walking state with the summoner
 
     // important before adding to the map!
     SetCharmGuid(possessed->GetObjectGuid());                           // save guid of charmed creature
@@ -10443,6 +10502,7 @@ Unit* Unit::TakePossessOf(SpellEntry const* spellEntry, uint32 effIdx, float x, 
 
     // set temp possess ai (creature will not be able to react by itself)
     charmInfo->SetCharmState("PossessedAI");
+    possessed->SetWalk(IsWalking(), true);                              // sync the walking state with the summoner - after SetCharmState
 
     // New flags for the duration of charm need to be set after SetCharmState, gets reset in ResetCharmState
     if (HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED))
@@ -10511,8 +10571,9 @@ bool Unit::TakePossessOf(Unit* possessed)
         possessedCreature = static_cast<Creature*>(possessed);
         possessedCreature->GetCombatStartPosition(combatStartPosition);
         possessedCreature->SetFactionTemporary(getFaction(), TEMPFACTION_NONE);
-        possessedCreature->SetWalk(IsWalking(), true);
+
         charmInfo->SetCharmState("PossessedAI");
+        possessedCreature->SetWalk(IsWalking(), true);
         getHostileRefManager().deleteReference(possessedCreature);
     }
     else if (possessed->GetTypeId() == TYPEID_PLAYER)
@@ -10638,7 +10699,10 @@ bool Unit::TakeCharmOf(Unit* charmed, uint32 spellId, bool advertised /*= true*/
             charmInfo->SetIsRetreating(true);
         }
 
+        // vanilla core only code - what is this for?
         charmedPlayer->ForceHealAndPowerUpdateInZone();
+        
+        charmedPlayer->SendForcedObjectUpdate();
     }
     else if (charmed->GetTypeId() == TYPEID_UNIT)
     {
@@ -10651,11 +10715,11 @@ bool Unit::TakeCharmOf(Unit* charmed, uint32 spellId, bool advertised /*= true*/
         else
             charmInfo->SetCharmState("PetAI");
 
+        charmedCreature->SetWalk(IsWalking(), true);
+
         getHostileRefManager().deleteReference(charmedCreature);
 
         charmedCreature->SetFactionTemporary(getFaction(), TEMPFACTION_NONE);
-
-        charmedCreature->SetWalk(IsWalking(), true);
 
         if (isPossessCharm)
             charmInfo->InitPossessCreateSpells();
@@ -10869,7 +10933,9 @@ void Unit::Uncharm(Unit* charmed, uint32 spellId)
         }
         else
         {
-            charmed->setFaction(charmedCreature->GetOwner()->getFaction());
+            // safeguard against nullptr on totem elemental despawn
+            if (Unit* owner = charmedCreature->GetOwner())
+                charmed->setFaction(owner->getFaction());
 
             charmInfo->ResetCharmState();
 
@@ -11038,24 +11104,24 @@ void Unit::UpdateAllowedPositionZ(float x, float y, float& z, Map* atMap /*=null
     if (!CanFly())
     {
         bool canSwim = CanSwim();
-        float ground_z = z, max_z;
+        float groundZ = GetMap()->GetHeight(x, y, z, canSwim), maxZ;
         if (canSwim)
-            max_z = atMap->GetTerrain()->GetWaterOrGroundLevel(x, y, z, &ground_z, !HasAuraType(SPELL_AURA_WATER_WALK), GetCollisionHeight());
+            maxZ = atMap->GetTerrain()->GetWaterOrGroundLevel(x, y, z, groundZ, !HasAuraType(SPELL_AURA_WATER_WALK), GetCollisionHeight());
         else
-            max_z = ground_z = atMap->GetHeight(x, y, z);
-        if (max_z > INVALID_HEIGHT)
+            maxZ = groundZ;
+        if (maxZ > INVALID_HEIGHT)
         {
-            if (z > max_z)
-                z = max_z;
-            else if (z < ground_z)
-                z = ground_z;
+            if (z > maxZ)
+                z = maxZ;
+            else if (z < groundZ)
+                z = groundZ;
         }
     }
     else
     {
-        float ground_z = atMap->GetHeight(x, y, z);
-        if (z < ground_z)
-            z = ground_z;
+        float groundZ = atMap->GetHeight(x, y, z);
+        if (z < groundZ)
+            z = groundZ;
     }
 }
 
@@ -11214,10 +11280,10 @@ void Unit::ClearComboPoints()
     if (Unit* target = ObjectAccessor::GetUnit(*this, m_comboTargetGuid))
         target->RemoveComboPointHolder(GetGUIDLow());
 
-    m_comboTargetGuid.Clear();
-
     if (IsPlayer())
         static_cast<Player*>(this)->SendComboPoints();
+
+    m_comboTargetGuid.Clear();
 }
 
 uint32 Unit::GetModifierXpBasedOnDamageReceived(uint32 xp)

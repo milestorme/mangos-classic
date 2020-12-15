@@ -319,7 +319,7 @@ void SpellLog::SendToSet()
 // ***********
 
 Spell::Spell(Unit* caster, SpellEntry const* info, uint32 triggeredFlags, ObjectGuid originalCasterGUID, SpellEntry const* triggeredBy) :
-    m_spellLog(this), m_spellScript(SpellScriptMgr::GetSpellScript(info->Id))
+    m_spellLog(this), m_spellScript(SpellScriptMgr::GetSpellScript(info->Id)), m_trueCaster(caster)
 {
     MANGOS_ASSERT(caster != nullptr && info != nullptr);
     MANGOS_ASSERT(info == sSpellTemplate.LookupEntry<SpellEntry>(info->Id) && "`info` must be pointer to sSpellTemplate element");
@@ -366,6 +366,7 @@ Spell::Spell(Unit* caster, SpellEntry const* info, uint32 triggeredFlags, Object
     unitTarget = nullptr;
     itemTarget = nullptr;
     gameObjTarget = nullptr;
+    corpseTarget = nullptr;
     focusObject = nullptr;
     m_triggeredByAuraSpell  = nullptr;
     m_spellAuraHolder = nullptr;
@@ -514,11 +515,18 @@ void Spell::FillTargetMap()
                 OnDestTarget();
                 AddDestExecution(SpellEffectIndex(i));
                 break;
+            case TARGET_TYPE_CORPSE: // can be unit and corpse
+                if (!targetingData.data[i].tempCorpseList.empty())
+                {
+                    CorpseList& corpseTargetList = targetingData.data[i].tempCorpseList;
+                    uint8 effectMask = targetMask[0] | targetMask[1];
+                    for (Corpse* corpse : corpseTargetList)
+                        AddCorpseTarget(corpse, effectMask);
+                }
             case TARGET_TYPE_UNIT:
             case TARGET_TYPE_UNIT_DEST:
             case TARGET_TYPE_PLAYER: // for now player handled here
             case TARGET_TYPE_SPECIAL_UNIT:
-            case TARGET_TYPE_CORPSE:
                 processedUnits = true;
                 for (uint8 rightTarget = 0; rightTarget < 2; ++rightTarget) // need to process target A and B separately due to effect masks
                 {
@@ -602,6 +610,8 @@ void Spell::FillTargetMap()
                             AddGOTarget(go, effectMask);
                     }
                 }
+                break;
+            default:
                 break;
         }
     }
@@ -894,6 +904,27 @@ void Spell::AddGOTarget(GameObject* target, uint8 effectMask)
     m_UniqueGOTargetInfo.push_back(targetInfo);
 }
 
+void Spell::AddCorpseTarget(Corpse* target, uint8 effectMask)
+{
+    m_targets.m_targetMask |= m_spellInfo->Targets;
+
+    // Lookup target in already in list
+    for (auto& ihit : m_uniqueCorpseTargetInfo)
+    {
+        if (target->GetObjectGuid() == ihit.corpseGUID) // Found in list
+        {
+            ihit.effectMask |= effectMask;            // Add only effect mask
+            return;
+        }
+    }
+
+    CorpseTargetInfo info;
+    info.corpseGUID = target->GetObjectGuid();
+    info.effectMask = effectMask;
+
+    m_uniqueCorpseTargetInfo.push_back(info);
+}
+
 void Spell::AddItemTarget(Item* item, uint8 effectMask)
 {
     // Lookup target in already in list
@@ -1055,18 +1086,21 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
 
         spellDamageInfo.damage = m_damage;
         spellDamageInfo.HitInfo = target->HitInfo;
-        if (target->isCrit)
+        if (!m_spellInfo->HasAttribute(SPELL_ATTR_EX3_NO_DONE_BONUS))
         {
-            spellDamageInfo.HitInfo |= SPELL_HIT_TYPE_CRIT;
-            spellDamageInfo.damage = caster->CalculateCritAmount(unitTarget, spellDamageInfo.damage, m_spellInfo);
-        }
+            if (target->isCrit)
+            {
+                spellDamageInfo.HitInfo |= SPELL_HIT_TYPE_CRIT;
+                spellDamageInfo.damage = caster->CalculateCritAmount(unitTarget, spellDamageInfo.damage, m_spellInfo);
+            }
 
-        // damage mitigation
-        if (spellDamageInfo.damage > 0)
-        {
-            // physical damage => armor
-            if (m_spellSchoolMask & SPELL_SCHOOL_MASK_NORMAL)
-                spellDamageInfo.damage = caster->CalcArmorReducedDamage(unitTarget, spellDamageInfo.damage);
+            // damage mitigation
+            if (spellDamageInfo.damage > 0)
+            {
+                // physical damage => armor
+                if (m_spellSchoolMask & SPELL_SCHOOL_MASK_NORMAL)
+                    spellDamageInfo.damage = caster->CalcArmorReducedDamage(unitTarget, spellDamageInfo.damage);
+            }
         }
 
         unitTarget->CalculateAbsorbResistBlock(caster, &spellDamageInfo, m_spellInfo);
@@ -1373,6 +1407,20 @@ void Spell::DoAllEffectOnTarget(ItemTargetInfo* target)
     OnHit(SPELL_MISS_NONE);
 }
 
+void Spell::DoAllEffectOnTarget(CorpseTargetInfo* target)
+{
+    uint32 effectMask = target->effectMask;
+    if (!target->corpseGUID || !effectMask)
+        return;
+
+    Corpse* corpse = ObjectAccessor::GetCorpseInMap(target->corpseGUID, m_caster->GetMapId());
+    if (!corpse)
+        return;
+
+    corpseTarget = corpse;
+    ExecuteEffects(nullptr, nullptr, nullptr, effectMask);
+}
+
 void Spell::HandleImmediateEffectExecution(TargetInfo* target)
 {
     // Get mask of effects for target
@@ -1564,13 +1612,13 @@ void Spell::SetTargetMap(SpellEffectIndex effIndex, uint32 targetMode, bool targ
                 case TARGET_LOCATION_CASTER_RIGHT:       angle -= M_PI_F / 2;     break;
             }
 
-            float x, y;
             float z = m_caster->GetPositionZ();
             if (radius == 0.f) // All shaman totems have 0 radius - need to override with proper value
                 radius = 2.f;
 
-            m_caster->GetNearPoint(m_caster, x, y, z, m_caster->GetObjectBoundingRadius(), radius, angle, m_caster->IsInWater());
-            m_targets.setDestination(x, y, z);
+            Position pos;
+            m_trueCaster->GetFirstCollisionPosition(pos, radius, angle);
+            m_targets.setDestination(pos.x, pos.y, pos.z);
             break;
         }
         case TARGET_LOCATION_CASTER_DEST:
@@ -2874,6 +2922,9 @@ void Spell::handle_immediate()
     for (auto& ihit : m_UniqueTargetInfo)
         DoAllEffectOnTarget(&ihit);
 
+    for (auto& ihit : m_uniqueCorpseTargetInfo)
+        DoAllEffectOnTarget(&ihit);
+
     for (auto& ihit : m_UniqueGOTargetInfo)
         DoAllEffectOnTarget(&ihit);
 
@@ -2889,10 +2940,12 @@ uint64 Spell::handle_delayed(uint64 t_offset)
     uint64 next_time = 0;
 
     if (!m_destTargetInfo.processed)
+    {
         if (m_destTargetInfo.timeDelay <= t_offset)
             DoAllTargetlessEffects(true);
         else if (next_time == 0 || m_destTargetInfo.timeDelay < next_time)
             next_time = m_destTargetInfo.timeDelay;
+    }
 
     // now recheck units targeting correctness (need before any effects apply to prevent adding immunity at first effect not allow apply second spell effect and similar cases)
     for (auto& ihit : m_UniqueTargetInfo)
@@ -2964,7 +3017,7 @@ void Spell::_handle_immediate_phase()
     m_diminishLevel = DIMINISHING_LEVEL_1;
     m_diminishGroup = DIMINISHING_NONE;
 
-    // handle none and dest targeted effects
+    // handle none targeted effects
     DoAllTargetlessEffects(false);
 
     // process items
@@ -2974,6 +3027,16 @@ void Spell::_handle_immediate_phase()
     // fill initial spell damage from caster for immediate effects
     for (auto& ihit : m_UniqueTargetInfo)
         HandleImmediateEffectExecution(&ihit);
+
+    // process self immediately
+    for (auto& ihit : m_UniqueTargetInfo)
+    {
+        if (ihit.targetGUID == m_caster->GetObjectGuid())
+        {
+            DoAllEffectOnTarget(&ihit);
+            break;
+        }
+    }
 
     // start channeling if applicable (after _handle_immediate_phase for get persistent effect dynamic object for channel target
     if (IsChanneledSpell(m_spellInfo) && m_duration)
@@ -3084,7 +3147,7 @@ void Spell::update(uint32 difftime)
                             if (target != m_caster)
                             {
                                 float orientation = m_caster->GetAngle(target);
-                                if (m_caster->GetTypeId() == TYPEID_UNIT)
+                                if (!m_caster->IsClientControlled())
                                 {
                                     m_caster->SetOrientation(orientation);
                                     m_caster->SetFacingTo(orientation);
@@ -3379,9 +3442,13 @@ void Spell::SendSpellStart() const
     if (m_CastItem)
         data << m_CastItem->GetPackGUID();
     else
+        data << m_trueCaster->GetPackGUID();
+
+    if (m_trueCaster->IsGameObject()) // write empty guid if GO
+        data << ObjectGuid().WriteAsPacked();
+    else
         data << m_caster->GetPackGUID();
 
-    data << m_caster->GetPackGUID();
     data << uint32(m_spellInfo->Id);                        // spellId
     data << uint16(castFlags);                              // cast flags
     data << uint32(m_timer);                                // delay?
@@ -3420,9 +3487,12 @@ void Spell::SendSpellGo()
     if (m_CastItem)
         data << m_CastItem->GetPackGUID();
     else
-        data << m_caster->GetPackGUID();
+        data << m_trueCaster->GetPackGUID();
 
-    data << m_caster->GetPackGUID();
+    if (m_trueCaster->IsGameObject()) // write empty guid if GO
+        data << ObjectGuid().WriteAsPacked();
+    else
+        data << m_caster->GetPackGUID();
     data << uint32(m_spellInfo->Id);                        // spellId
     data << uint16(castFlags);                              // cast flags
 
@@ -3701,24 +3771,6 @@ void Spell::SendChannelStart(uint32 duration)
         m_caster->AI()->OnChannelStateChange(this, true, target);
 }
 
-void Spell::SendResurrectRequest(Player* target) const
-{
-    // Both players and NPCs can resurrect using spells - have a look at creature 28487 for example
-    // However, the packet structure differs slightly
-
-    const char* sentName = m_caster->GetTypeId() == TYPEID_PLAYER ? "" : m_caster->GetNameForLocaleIdx(target->GetSession()->GetSessionDbLocaleIndex());
-
-    WorldPacket data(SMSG_RESURRECT_REQUEST, (8 + 4 + strlen(sentName) + 1 + 1 + 1));
-    data << m_caster->GetObjectGuid();
-    data << uint32(strlen(sentName) + 1);
-
-    data << sentName;
-    data << uint8(m_caster->isSpiritHealer());
-    // override delay sent with SMSG_CORPSE_RECLAIM_DELAY, set instant resurrection for spells with this attribute
-    data << uint8(!m_spellInfo->HasAttribute(SPELL_ATTR_EX3_IGNORE_RESURRECTION_TIMER));
-    target->GetSession()->SendPacket(data);
-}
-
 void Spell::TakeCastItem()
 {
     if (!m_CastItem || m_caster->GetTypeId() != TYPEID_PLAYER)
@@ -3937,7 +3989,7 @@ void Spell::HandleThreatSpells()
         // positive spells distribute threat among all units that are in combat with target, like healing
         if (positive)
         {
-            target->getHostileRefManager().threatAssist(m_caster /*real_caster ??*/, threat, m_spellInfo);
+            target->getHostileRefManager().threatAssist(m_caster /*real_caster ??*/, threat, m_spellInfo, false, true);
         }
         // for negative spells threat gets distributed among affected targets
         else
@@ -4304,8 +4356,8 @@ SpellCastResult Spell::CheckCast(bool strict)
             if (non_caster_target && m_spellInfo->HasAttribute(SPELL_ATTR_EX_NOT_IN_COMBAT_TARGET) && target->IsInCombat())
                 return SPELL_FAILED_TARGET_AFFECTING_COMBAT;
 
-            // check if target is affected by Spirit of Redemption (Aura: 27827)
-            if (target->HasAuraType(SPELL_AURA_SPIRIT_OF_REDEMPTION))
+            // check if target is affected by Spirit of Redemption (Aura: 27827) unless death persistent
+            if (target->HasAuraType(SPELL_AURA_SPIRIT_OF_REDEMPTION) && !m_spellInfo->HasAttribute(SPELL_ATTR_EX3_DEATH_PERSISTENT))
                 return SPELL_FAILED_BAD_TARGETS;
 
             // Check if more powerful spell applied on target (if spell only contains non-aoe auras)
@@ -4738,7 +4790,7 @@ SpellCastResult Spell::CheckCast(bool strict)
                 {
                     float range = GetSpellMaxRange(sSpellRangeStore.LookupEntry(m_spellInfo->rangeIndex));
 
-                    WorldLocation pos;
+                    Position pos;
                     target->GetFirstCollisionPosition(pos, target->GetCombatReach(), target->GetAngle(m_caster));
 
                     // TODO: Implement jumpin case check
@@ -4746,7 +4798,7 @@ SpellCastResult Spell::CheckCast(bool strict)
                     //{
                     PathFinder pathFinder(m_caster);
                     pathFinder.setPathLengthLimit(range * 1.5f);
-                    bool result = pathFinder.calculate(pos.coord_x, pos.coord_y, pos.coord_z);
+                    bool result = pathFinder.calculate(pos.x, pos.y, pos.z);
 
                     if (pathFinder.getPathType() & PATHFIND_SHORT)
                         return SPELL_FAILED_OUT_OF_RANGE;
@@ -4815,6 +4867,9 @@ SpellCastResult Spell::CheckCast(bool strict)
 
                     // check if its in use only when cast is finished (called from spell::cast() with strict = false)
                     if (!strict && go->IsInUse())
+                        return SPELL_FAILED_CHEST_IN_USE;
+
+                    if (!strict && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_IN_USE))
                         return SPELL_FAILED_CHEST_IN_USE;
 
                     // done in client but we need to recheck anyway
@@ -6368,7 +6423,7 @@ SpellEvent::~SpellEvent()
     if (m_Spell->getState() != SPELL_STATE_FINISHED)
         m_Spell->cancel();
 
-    if (m_Spell->IsDeletable())
+    if (m_Spell->IsDeletable() || World::IsStopped())
     {
         delete m_Spell;
     }
@@ -6624,7 +6679,12 @@ WorldObject* Spell::GetCastingObject() const
 
 float Spell::GetSpellSpeed() const
 {
-    if (IsChanneledSpell(m_spellInfo)) return 0.f; return m_spellInfo->speed;
+    if (m_trueCaster->IsGameObject()) // 4 spells in all of wotlk and doesnt seem like GO casting supports travelling delay from sniffs
+        return 0.f;
+    if (IsChanneledSpell(m_spellInfo))
+        return 0.f;
+    
+    return m_spellInfo->speed;
 }
 
 void Spell::ResetEffectDamageAndHeal()
@@ -6884,6 +6944,7 @@ void Spell::FilterTargetMap(UnitList& filterUnitList, SpellEffectIndex effIndex,
                 break;
             UnitList newList;
             newList.push_back(unitTarget);
+            bool isInGroup = m_caster->IsInGroup(unitTarget);
             filterUnitList.pop_front();
             filterUnitList.sort(LowestHPNearestOrder(unitTarget, DIST_CALC_COMBAT_REACH));
             Unit* prev = unitTarget;
@@ -6899,6 +6960,12 @@ void Spell::FilterTargetMap(UnitList& filterUnitList, SpellEffectIndex effIndex,
                 }
 
                 if (!prev->IsWithinLOSInMap(*next, true))
+                {
+                    ++next;
+                    continue;
+                }
+
+                if (isInGroup && !m_caster->IsInGroup(*next))
                 {
                     ++next;
                     continue;
@@ -6932,8 +6999,7 @@ void Spell::FillFromTargetFlags(TempTargetingData& targetingData, SpellEffectInd
         else if (m_targets.getCorpseTargetGuid())
         {
             if (Corpse* corpse = m_targets.getCorpseTarget())
-                if (Player* owner = ObjectAccessor::FindPlayer(corpse->GetOwnerGuid()))
-                    targetingData.data[effIdx].tmpUnitList[false].push_back(owner);
+                targetingData.data[effIdx].tempCorpseList.push_back(corpse);
         }
     }
     else if (m_spellInfo->Targets & (TARGET_FLAG_ITEM | TARGET_FLAG_TRADE_ITEM))

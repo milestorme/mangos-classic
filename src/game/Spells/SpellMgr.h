@@ -387,6 +387,7 @@ inline bool IsSpellRemovedOnEvade(SpellEntry const* spellInfo)
         case 6718:          // Phasing Stealth
         case 6752:          // Weak Poison Proc
         case 6947:          // Curse of the Bleakheart Proc
+        case 7056:          // Pacified
         case 7090:          // Bear Form (Shapeshift)
         case 7165:          // Battle Stance (Rank 1)
         case 7276:          // Poison Proc
@@ -444,6 +445,8 @@ inline bool IsSpellRemovedOnEvade(SpellEntry const* spellInfo)
         case 19194:         // Double Attack
         case 19195:         // Hate to 90% (Hate to 90%)
         case 19396:         // Incinerate (Incinerate)
+        case 19483:         // Immolation
+        case 19514:         // Lightning Shield
         case 19626:         // Fire Shield (Fire Shield)
         case 19640:         // Pummel (Pummel)
         case 19817:         // Double Attack
@@ -803,6 +806,10 @@ inline bool IsUnitTargetTarget(uint32 target)
         case TARGET_UNIT:
         case TARGET_UNIT_FRIEND:
         case TARGET_UNIT_FRIEND_CHAIN_HEAL:
+        case TARGET_UNIT_PARTY:
+        case TARGET_UNIT_RAID:
+        case TARGET_UNIT_FRIEND_AND_PARTY:
+        case TARGET_LOCATION_CASTER_TARGET_POSITION:
             return true;
         default: return false;
     }
@@ -1084,18 +1091,6 @@ inline void GetChainJumpRange(SpellEntry const* spellInfo, SpellEffectIndex effI
             break;
         default:   // default jump radius
             break;
-    }
-}
-
-// Research function for spells that should be send as GO caster in packet
-inline bool IsGOCastSpell(SpellEntry const* spellInfo)
-{
-    switch (spellInfo->Id)
-    {
-        case 30979:  // Flames
-            return true;
-        default:
-            return false;
     }
 }
 
