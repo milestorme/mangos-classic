@@ -19,7 +19,7 @@ SDName: dire_maul
 SD%Complete: 100%
 SDComment: Quest support: 7631.
 SDCategory: Dire Maul
-EndScriptData
+EndScriptData */
 
 /* ContentData
 event_spells_warlock_dreadsteed
@@ -196,10 +196,12 @@ struct DreadsteedQuestObjects : public GameObjectAI
                 if (instance_dire_maul* instance = (instance_dire_maul*)m_go->GetInstanceData())
                     if (GameObject* candleAura = instance->GetSingleGameObjectFromStorage(GO_RITUAL_CANDLE_AURA))
                         if (Unit* target = m_go->GetMap()->GetUnit(m_lastUserGuid))
+                        {
                             if (spellId == SPELL_RITUAL_CANDLE_AURA)
                                 candleAura->CastSpell(target, nullptr, spellId, TRIGGERED_OLD_TRIGGERED);
                             else
                                 m_go->CastSpell(target, nullptr, spellId, TRIGGERED_OLD_TRIGGERED);
+                        }
 
                 m_uiPulseTimer = 6000;
             }
